@@ -10,7 +10,7 @@ export async function GET(req: Request) {
     const url = new URL(req.url);
     const conversationId = url.searchParams.get("conversation");
 
-    // If Supabase not configured, use in-memory store
+    // Local sandbox mode (if Supabase not configured in .env)
     if (!isSupabaseConfigured()) {
       if (conversationId) {
         const messages = mockStore.getMessages(conversationId);
@@ -22,18 +22,12 @@ export async function GET(req: Request) {
       });
     }
 
+    // Production Supabase mode
     const supabase = await createClient();
     const { data: { user }, error: authError } = await supabase.auth.getUser();
 
-    // If unauthenticated in Supabase mode, still allow graceful fallback
     if (authError || !user) {
-      if (conversationId) {
-        return NextResponse.json({ messages: mockStore.getMessages(conversationId) });
-      }
-      return NextResponse.json({
-        sites: mockStore.getAllSites(),
-        conversations: mockStore.getAllConversations(),
-      });
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
     // Fetch messages for a specific conversation
@@ -44,9 +38,8 @@ export async function GET(req: Request) {
         .eq("id", conversationId)
         .single();
 
-      if (!conv) {
-        // Fallback to mock store
-        return NextResponse.json({ messages: mockStore.getMessages(conversationId) });
+      if (!conv || (conv.websites as any)?.agent_id !== user.id) {
+        return NextResponse.json({ error: "Not found" }, { status: 404 });
       }
 
       const { data: messages } = await supabase
@@ -58,15 +51,15 @@ export async function GET(req: Request) {
       return NextResponse.json({ messages: messages || [] });
     }
 
-    // Fetch all sites + conversations
-    const { data: sites } = await supabase
+    // Fetch ONLY this agent's websites
+    const { data: userSites } = await supabase
       .from("websites")
       .select("*")
       .eq("agent_id", user.id)
       .order("created_at");
 
-    const siteList = sites && sites.length > 0 ? sites : mockStore.getAllSites();
-    const siteIds = siteList.map((s) => s.id);
+    const sites = userSites || [];
+    const siteIds = sites.map((s) => s.id);
 
     let conversations: any[] = [];
     if (siteIds.length > 0) {
@@ -97,18 +90,13 @@ export async function GET(req: Request) {
             last_sender: lastMsg?.sender || "visitor",
           });
         }
-      } else {
-        conversations = mockStore.getAllConversations();
       }
     }
 
-    return NextResponse.json({ sites: siteList, conversations });
+    return NextResponse.json({ sites, conversations });
   } catch (e: any) {
-    console.error(e);
-    return NextResponse.json({
-      sites: mockStore.getAllSites(),
-      conversations: mockStore.getAllConversations(),
-    });
+    console.error("Agent GET error:", e);
+    return NextResponse.json({ error: "Server error" }, { status: 500 });
   }
 }
 
@@ -118,7 +106,7 @@ export async function POST(req: Request) {
     const body = await req.json();
     const { action } = body;
 
-    // In-memory fallback if not configured
+    // Local sandbox mode
     if (!isSupabaseConfigured()) {
       if (action === "saveSite") {
         const saved = mockStore.saveSite(body);
@@ -144,49 +132,34 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "Unknown action" }, { status: 400 });
     }
 
+    // Production Supabase mode
     const supabase = await createClient();
     const { data: { user }, error: authError } = await supabase.auth.getUser();
+
     if (authError || !user) {
-      // Mock store handling if unauthenticated
-      if (action === "saveSite") return NextResponse.json({ id: mockStore.saveSite(body).id });
-      if (action === "message") {
-        return NextResponse.json({
-          id: mockStore.addMessage({
-            conversation_id: body.conversation,
-            sender: "agent",
-            kind: body.kind || "reply",
-            body: body.body,
-          }).id,
-        }, { status: 201 });
-      }
-      if (action === "update") {
-        mockStore.updateConversation(body.conversation, body);
-        return NextResponse.json({ ok: true });
-      }
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
     // ── Save / Update a website ──────────────────────────────
     if (action === "saveSite") {
       const payload = {
-        agent_id: user.id,
+        agent_id: user.id, // Strictly tied to logged-in client
         name: body.name,
-        origin: body.origin,
-        color: body.color,
-        greeting: body.greeting,
-        position: body.position,
-        online: body.online,
+        origin: body.origin || "*",
+        color: body.color || "#6366f1",
+        greeting: body.greeting || "Hi there! How can we help?",
+        position: body.position || "right",
+        online: body.online !== false,
         ai_enabled: body.ai_enabled ?? false,
       };
 
-      if (body.id) {
+      if (body.id && !body.id.startsWith("site-") && !body.id.startsWith("demo-")) {
         const { error } = await supabase
           .from("websites")
           .update(payload)
           .eq("id", body.id)
           .eq("agent_id", user.id);
         if (error) throw error;
-        mockStore.saveSite(body);
         return NextResponse.json({ id: body.id });
       } else {
         const { data, error } = await supabase
@@ -195,7 +168,6 @@ export async function POST(req: Request) {
           .select("id")
           .single();
         if (error) throw error;
-        mockStore.saveSite({ ...body, id: data.id });
         return NextResponse.json({ id: data.id }, { status: 201 });
       }
     }
@@ -204,38 +176,56 @@ export async function POST(req: Request) {
     if (action === "message") {
       const { conversation, body: msgBody, kind } = body;
 
-      mockStore.addMessage({
-        conversation_id: conversation,
-        sender: "agent",
-        kind: kind || "reply",
-        body: msgBody,
-      });
+      // Verify ownership
+      const { data: conv } = await supabase
+        .from("conversations")
+        .select("id, websites!inner(agent_id)")
+        .eq("id", conversation)
+        .single();
+
+      if (!conv || (conv.websites as any)?.agent_id !== user.id) {
+        return NextResponse.json({ error: "Unauthorized" }, { status: 403 });
+      }
 
       const { data: msg, error } = await supabase
         .from("messages")
-        .insert({ conversation_id: conversation, sender: "agent", kind: kind || "reply", body: msgBody })
+        .insert({
+          conversation_id: conversation,
+          sender: "agent",
+          kind: kind || "reply",
+          body: msgBody,
+        })
         .select("id")
         .single();
+      if (error) throw error;
 
-      if (!error) {
-        await supabase
-          .from("conversations")
-          .update({ updated_at: new Date().toISOString(), unread: 0 })
-          .eq("id", conversation);
-      }
+      await supabase
+        .from("conversations")
+        .update({ updated_at: new Date().toISOString(), unread: 0 })
+        .eq("id", conversation);
 
-      return NextResponse.json({ id: msg?.id || "local-" + Date.now() }, { status: 201 });
+      return NextResponse.json({ id: msg.id }, { status: 201 });
     }
 
     // ── Update conversation (status, priority, read) ─────────
     if (action === "update") {
       const { conversation, status, priority, read } = body;
+
+      // Verify ownership
+      const { data: conv } = await supabase
+        .from("conversations")
+        .select("id, websites!inner(agent_id)")
+        .eq("id", conversation)
+        .single();
+
+      if (!conv || (conv.websites as any)?.agent_id !== user.id) {
+        return NextResponse.json({ error: "Unauthorized" }, { status: 403 });
+      }
+
       const patch: any = {};
       if (status !== undefined) patch.status = status;
       if (priority !== undefined) patch.priority = priority;
       if (read) patch.unread = 0;
-
-      mockStore.updateConversation(conversation, patch);
 
       if (Object.keys(patch).length > 0) {
         await supabase.from("conversations").update(patch).eq("id", conversation);
@@ -245,7 +235,7 @@ export async function POST(req: Request) {
 
     return NextResponse.json({ error: "Unknown action" }, { status: 400 });
   } catch (e: any) {
-    console.error(e);
+    console.error("Agent POST error:", e);
     return NextResponse.json({ error: e.message || "Server error" }, { status: 500 });
   }
 }

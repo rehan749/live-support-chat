@@ -142,13 +142,15 @@ export default function DashboardPage() {
   const [search, setSearch] = useState('');
   const [selectedSiteFilter, setSelectedSiteFilter] = useState('all');
 
+  const [authChecking, setAuthChecking] = useState(true);
+
   // Data states
-  const [sites, setSites] = useState<Website[]>(initialDemoSites);
-  const [conversations, setConversations] = useState<Conversation[]>(initialDemoChats);
-  const [selectedId, setSelectedId] = useState<string | null>('demo-conv-1');
-  const [messages, setMessages] = useState<Message[]>(initialDemoMessages['demo-conv-1'] || []);
+  const [sites, setSites] = useState<Website[]>([]);
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
   const [agentUser, setAgentUser] = useState<{ email: string; name: string }>({
-    email: 'agent@supportly.local',
+    email: '',
     name: 'Support Agent',
   });
 
@@ -162,12 +164,12 @@ export default function DashboardPage() {
   const [addSiteOpen, setAddSiteOpen] = useState(false);
   const [testModalOpen, setTestModalOpen] = useState(false);
   const [quickRepliesOpen, setQuickRepliesOpen] = useState(false);
-  const [activeSiteId, setActiveSiteId] = useState(initialDemoSites[0].id);
+  const [activeSiteId, setActiveSiteId] = useState<string>('');
 
   // Site editing
   const [editingSite, setEditingSite] = useState<Partial<Website>>({
-    name: 'My Online Store',
-    origin: 'https://mystore.example.com',
+    name: '',
+    origin: '',
     color: '#6366f1',
     greeting: 'Hi there! 👋 How can we help you today?',
     position: 'right',
@@ -192,8 +194,16 @@ export default function DashboardPage() {
       const res = await fetch('/api/agent');
       if (res.ok) {
         const data = await res.json();
-        if (data.sites && data.sites.length > 0) setSites(data.sites);
-        if (data.conversations) {
+        if (Array.isArray(data.sites)) {
+          setSites(data.sites);
+          if (data.sites.length > 0) {
+            setActiveSiteId((prev) => {
+              const exists = data.sites.some((s: any) => s.id === prev);
+              return exists ? prev : data.sites[0].id;
+            });
+          }
+        }
+        if (Array.isArray(data.conversations)) {
           setConversations(data.conversations);
           setSelectedId((prev) => {
             if (!prev && data.conversations.length > 0) return data.conversations[0].id;
@@ -201,36 +211,45 @@ export default function DashboardPage() {
             return exists ? prev : (data.conversations[0]?.id || null);
           });
         }
+      } else if (res.status === 401) {
+        router.replace('/login');
       }
     } catch {}
-  }, []);
+  }, [router]);
+
+  // Verify authentication on mount
+  useEffect(() => {
+    async function checkUser() {
+      if (configured) {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!user) {
+          router.replace('/login');
+          return;
+        }
+        setAgentUser({
+          email: user.email || '',
+          name: user.user_metadata?.full_name || user.email?.split('@')[0] || 'Support Agent',
+        });
+        setAuthChecking(false);
+        loadData();
+      } else {
+        setAuthChecking(false);
+        loadData();
+      }
+    }
+    checkUser();
+  }, [configured, router, supabase, loadData]);
 
   // Poll for new conversations every 2 seconds
   useEffect(() => {
-    loadData();
+    if (authChecking) return;
     const interval = setInterval(() => {
       if (!document.hidden) {
         loadData();
       }
     }, 2000);
     return () => clearInterval(interval);
-  }, [loadData]);
-
-  // Load user
-  useEffect(() => {
-    async function checkUser() {
-      if (configured) {
-        const { data: { user } } = await supabase.auth.getUser();
-        if (user) {
-          setAgentUser({
-            email: user.email || 'agent@supportly.local',
-            name: user.user_metadata?.full_name || 'Support Agent',
-          });
-        }
-      }
-    }
-    checkUser();
-  }, [configured, supabase]);
+  }, [authChecking, loadData]);
 
   // Fetch messages for selected conversation
   const loadConversationMessages = useCallback(async (convId: string) => {
@@ -342,24 +361,21 @@ export default function DashboardPage() {
   // Save website settings
   const handleSaveSite = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!activeSite?.id) return;
     setBusy(true);
 
-    const siteToSave: Website = {
+    const siteToSave = {
       id: activeSite.id,
-      agent_id: 'current-agent',
-      name: editingSite.name || 'Support Site',
-      origin: editingSite.origin || 'https://example.com',
-      color: editingSite.color || '#6366f1',
-      greeting: editingSite.greeting || 'Hi there!',
+      name: editingSite.name || activeSite.name,
+      origin: editingSite.origin || activeSite.origin || '*',
+      color: editingSite.color || activeSite.color || '#6366f1',
+      greeting: editingSite.greeting || activeSite.greeting || 'Hi there!',
       position: (editingSite.position as 'left' | 'right') || 'right',
       online: editingSite.online !== undefined ? Boolean(editingSite.online) : true,
-      created_at: new Date().toISOString(),
     };
 
-    setSites((prev) => prev.map((s) => (s.id === siteToSave.id ? siteToSave : s)));
-
     try {
-      await fetch('/api/agent', {
+      const res = await fetch('/api/agent', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -367,46 +383,57 @@ export default function DashboardPage() {
           ...siteToSave,
         }),
       });
-      loadData();
-    } catch {}
-
-    showToast('Widget settings saved!');
-    setBusy(false);
+      if (res.ok) {
+        await loadData();
+        showToast('Store settings updated live!');
+      } else {
+        showToast('Failed to update store.');
+      }
+    } catch {
+      showToast('Error updating store.');
+    } finally {
+      setBusy(false);
+    }
   };
 
   // Add new website
   const handleAddNewSite = async (e: React.FormEvent) => {
     e.preventDefault();
-    const newSiteId = 'site-' + Date.now();
-    const newSite: Website = {
-      id: newSiteId,
-      agent_id: 'current-agent',
-      name: editingSite.name || 'New Website',
-      origin: editingSite.origin || 'https://mywebsite.com',
-      color: editingSite.color || '#6366f1',
-      greeting: editingSite.greeting || 'Hello! How can we assist you?',
-      position: 'right',
-      online: true,
-      created_at: new Date().toISOString(),
-    };
-
-    setSites((prev) => [...prev, newSite]);
-    setActiveSiteId(newSiteId);
-    setAddSiteOpen(false);
+    setBusy(true);
 
     try {
-      await fetch('/api/agent', {
+      const res = await fetch('/api/agent', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action: 'saveSite',
-          ...newSite,
+          name: editingSite.name || 'My Store',
+          origin: editingSite.origin || '*',
+          color: editingSite.color || '#6366f1',
+          greeting: editingSite.greeting || 'Hi there! How can we help?',
+          position: 'right',
+          online: true,
         }),
       });
-      loadData();
-    } catch {}
 
-    showToast('Website added successfully!');
+      if (res.ok) {
+        const data = await res.json();
+        await loadData();
+        if (data.id) {
+          setActiveSiteId(data.id);
+          setEditingSite((prev) => ({ ...prev, id: data.id }));
+        }
+        setAddSiteOpen(false);
+        setView('widget');
+        showToast('Store created! You can now copy your widget code below.');
+      } else {
+        showToast('Failed to create store.');
+      }
+    } catch {
+      showToast('Error creating store.');
+    } finally {
+      setBusy(false);
+    }
   };
 
   const handleSignOut = async () => {
@@ -416,8 +443,17 @@ export default function DashboardPage() {
     router.push('/login');
   };
 
-  const appOrigin = typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
-  const embedCode = `<script src="${appOrigin}/widget.js" data-site="${activeSite?.id || 'demo-site'}" defer></script>`;
+  const appOrigin = typeof window !== 'undefined' ? window.location.origin : 'https://live-support-chat.vercel.app';
+  const embedCode = `<script src="${appOrigin}/widget.js" data-site="${activeSite?.id || ''}" defer></script>`;
+
+  if (authChecking) {
+    return (
+      <div className="h-screen w-screen flex flex-col items-center justify-center bg-slate-50 text-slate-500">
+        <Loader2 size={32} className="animate-spin text-indigo-600 mb-2" />
+        <p className="text-xs font-medium">Verifying your support workspace...</p>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-screen bg-slate-50 font-sans text-slate-800 antialiased overflow-hidden">
@@ -908,6 +944,26 @@ export default function DashboardPage() {
                     </div>
                   </form>
                 </div>
+              </div>
+            ) : sites.length === 0 ? (
+              <div className="flex-1 flex flex-col items-center justify-center p-8 text-center">
+                <div className="w-16 h-16 rounded-2xl bg-indigo-50 text-indigo-600 flex items-center justify-center mx-auto mb-4">
+                  <Globe size={32} />
+                </div>
+                <h3 className="font-bold text-slate-900 text-base">Welcome to your Support Workspace!</h3>
+                <p className="text-xs text-slate-500 max-w-md mt-1 mb-5 leading-relaxed">
+                  You haven&apos;t connected a store yet. Click below to add your store name, website URL, and get your live chat widget snippet.
+                </p>
+                <button
+                  onClick={() => {
+                    setEditingSite({ name: '', origin: '', color: '#6366f1', greeting: 'Hi there! 👋 How can we help?' });
+                    setAddSiteOpen(true);
+                  }}
+                  className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-semibold shadow-md flex items-center gap-2 transition"
+                >
+                  <Plus size={16} />
+                  <span>Connect Your First Store</span>
+                </button>
               </div>
             ) : (
               <div className="flex-1 flex flex-col items-center justify-center p-8 text-center text-slate-400">

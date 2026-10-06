@@ -355,9 +355,19 @@
     fetch(serverOrigin + '/api/widget?site=' + encodeURIComponent(siteId) +
       '&conversation=' + encodeURIComponent(storedData.conversation_id) +
       '&token=' + encodeURIComponent(storedData.token))
-      .then(function (res) { return res.json(); })
+      .then(function (res) {
+        if (res.status === 401 || res.status === 404) {
+          // Stale / expired conversation from previous test or another server!
+          try { localStorage.removeItem(storageKey); } catch (e) {}
+          storedData = null;
+          messages = [];
+          render();
+          return null;
+        }
+        return res.json();
+      })
       .then(function (data) {
-        if (data.messages && data.messages.length !== messages.length) {
+        if (data && data.messages && data.messages.length !== messages.length) {
           messages = data.messages;
           render();
         }
@@ -385,8 +395,15 @@
         message: text,
       }),
     })
-      .then(function () {
-        setTimeout(fetchMessages, 1200);
+      .then(function (res) {
+        if (res.status === 401 || res.status === 404) {
+          try { localStorage.removeItem(storageKey); } catch (e) {}
+          storedData = null;
+          messages = [];
+          render();
+          return;
+        }
+        setTimeout(fetchMessages, 1000);
       })
       .catch(function () {});
   }
